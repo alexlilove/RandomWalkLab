@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>Случайные блуждания — решётка и отрезки</title>
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: #0b0e12;
+      color: #e6e6e6;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, "Helvetica Neue", Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      user-select: none;
+      touch-action: none; /* чтобы управлять жестами самостоятельно */
+      -webkit-tap-highlight-color: transparent;
+    }
+    #wrap { position: fixed; inset: 0; }
+    canvas { display: block; width: 100%; height: 100%; }
+
+    /* Верхняя плашка-инструкция */
+    .banner {
+      position: absolute;
+      top: 70px; left: 20px; position: absolute; width: 300px;
+      background: rgba(30,35,42,0.9);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 14px;
+      padding: 6px 25px 3px 14px;
+      font-size: 14px;
+      line-height: 1.3;
+      
+      backdrop-filter: blur(2px);
+      box-shadow: 0 6px 18px rgba(0,0,0,0.35);
+      
+      pointer-events: auto; /* чтобы кликать по крестику */
+    }
+    .banner.hidden {
+      display: none;
+    }
+    .close-btn {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      width: 20px;
+      height: 20px;
+      cursor: pointer;
+      opacity: 0.7;
+      transition: opacity 0.2s;
+    }
+    .close-btn:hover {
+      opacity: 1;
+    }
+    .close-btn::before, .close-btn::after {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 14px;
+      height: 2px;
+      background: #e6e6e6;
+    }
+    .close-btn::before {
+      transform: translate(-50%, -50%) rotate(45deg);
+    }
+    .close-btn::after {
+      transform: translate(-50%, -50%) rotate(-45deg);
+    }
+
+    /* Кнопки управления */
+    .btn {
+      position: fixed; display: inline-flex; align-items: center; justify-content: center;
+      width: 44px; height: 44px; border-radius: 12px;
+      background: rgba(35,40,48,0.95);
+      border: 1px solid rgba(255,255,255,0.08);
+      box-shadow: 0 4px 14px rgba(0,0,0,0.3);
+      cursor: pointer; user-select: none;
+      font-size: 20px;
+    }
+    .btn:active { transform: translateY(1px); }
+
+    /* ↩️ и 🔄 — справа сверху */
+    #undo { top: 10px; right: 62px; }
+    #reset { top: 10px; right: 10px; }
+
+    /* Переключатель режима (сплошной/прерывистый) — слева снизу */
+    #modeToggle {
+      left: 10px; bottom: 10px; width: auto; padding: 0 12px; gap: 8px;
+      font-size: 14px; height: 40px;
+    }
+    #modeBadge {
+      margin-left: 8px; padding: 2px 8px; border-radius: 999px; font-size: 12px;
+      background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+
+    /* Подсказки выбора точек */
+    .hud { position: fixed; left: 50%; transform: translateX(-50%);
+      bottom: 10px; font-size: 12px; color: #9fb3c8; opacity: 0.85; }
+  </style>
+</head>
+<body>
+  <div id="wrap"><canvas id="cv"></canvas></div>
+  <div class="banner" id="banner">
+    <div class="close-btn" id="closeBtn"></div>
+   <p> • Добавляйте и перемещайте точки. Удаляйте удержанием. </p>
+   <p> • Выберите две точки — через них пройдет отрезок (сплошной или прерывистый).</p>
+    <p>• Двойным тапом по точке удаляйте проходящие через нее отрезки.</p>
+  </div>
+
+  <div id="undo" class="btn" title="Шаг назад (↩️)">↩️</div>
+  <div id="reset" class="btn" title="Рестарт (🔄)">🔄</div>
+
+  <div id="modeToggle" class="btn" title="Режим отрезков: сплошной / прерывистый">
+    <span id="modeIcon">━</span>
+    <span id="modeBadge">сплошной</span>
+  </div>
+
+  <div class="hud" id="hud"></div>
+
+  <script>
+  (() => {
+    const canvas = document.getElementById('cv');
+    const ctx = canvas.getContext('2d');
+
+    // Состояние сцены
+    let state = {
+      points: [],           // [{id, x, y, selected:false}]
+      segments: [],         // [{aId, bId, dashed:false}]
+      dashedMode: false,    // текущий режим рисования отрезков
+      selection: [],        // массив id выбранных точек (макс 2)
+      pan: {x: 0, y: 0},    // смещение мира в пикселях
+      scale: 35,            // пикс/единицу (без зума — фикс.)
+    };
+
+    const history = [];
+    function pushHistory() { history.push(JSON.stringify(state)); }
+    function undo() {
+      if (!history.length) return;
+      state = JSON.parse(history.pop());
+      render();
+    }
+
+    // Утилиты преобразования координат
+    function resize() {
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      canvas.width = Math.floor(canvas.clientWidth * dpr);
+      canvas.height = Math.floor(canvas.clientHeight * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      render();
+    }
+
+    function worldToScreen(wx, wy) {
+      return [wx * state.scale + state.pan.x + canvas.clientWidth/2, -wy * state.scale + state.pan.y + canvas.clientHeight/2];
+    }
+    function screenToWorld(sx, sy) {
+      const wx = (sx - canvas.clientWidth/2 - state.pan.x) / state.scale;
+      const wy = -(sy - canvas.clientHeight/2 - state.pan.y) / state.scale;
+      return [wx, wy];
+    }
+
+    // Поиск/создание точек
+    let nextId = 1;
+    function keyFromXY(x, y) { return `${x},${y}`; }
+    function findPointAtInt(x, y) { return state.points.find(p => p.x === x && p.y === y); }
+
+    function addPoint(ix, iy) {
+      if (findPointAtInt(ix, iy)) return null; // уже есть
+      const p = { id: nextId++, x: ix, y: iy, selected: false };
+      pushHistory();
+      state.points.push(p);
+      return p;
+    }
+    function removePoint(id) {
+      const p = state.points.find(pt => pt.id === id);
+      if (!p) return;
+      pushHistory();
+      // удаляем отрезки через эту точку
+      state.segments = state.segments.filter(s => s.aId !== id && s.bId !== id);
+      state.points = state.points.filter(pt => pt.id !== id);
+      state.selection = state.selection.filter(i => i !== id);
+    }
+
+    function toggleSelectPoint(id) {
+      const p = state.points.find(pt => pt.id === id);
+      if (!p) return;
+      p.selected = !p.selected;
+      if (p.selected) {
+        state.selection.push(p.id);
+        if (state.selection.length > 2) {
+          // оставляем последние две
+          const firstId = state.selection.shift();
+          const old = state.points.find(pp => pp.id === firstId); if (old) old.selected = false;
+        }
+      } else {
+        state.selection = state.selection.filter(i => i !== p.id);
+      }
+    }
+
+    function addOrToggleSegmentBetween(aId, bId) {
+      if (aId === bId) return;
+      const [minId, maxId] = aId < bId ? [aId, bId] : [bId, aId];
+      const idx = state.segments.findIndex(s => (s.aId === minId && s.bId === maxId));
+      pushHistory();
+      if (idx >= 0) {
+        // если уже есть — обновляем стиль по текущему режиму
+        state.segments[idx].dashed = state.dashedMode;
+      } else {
+        state.segments.push({ aId: minId, bId: maxId, dashed: state.dashedMode });
+      }
+    }
+
+    function removeSegmentsThroughPoint(id) {
+      const before = state.segments.length;
+      if (!before) return 0;
+      pushHistory();
+      state.segments = state.segments.filter(s => s.aId !== id && s.bId !== id);
+      return before - state.segments.length;
+    }
+
+    // Перемещение точки (с привязкой к решётке)
+    function movePoint(id, newX, newY) {
+      const p = state.points.find(pt => pt.id === id);
+      if (!p) return;
+      if (p.x === newX && p.y === newY) return;
+      pushHistory();
+      p.x = newX; p.y = newY;
+    }
+
+    // Рендеринг
+    function render() {
+      const w = canvas.clientWidth, h = canvas.clientHeight;
+      ctx.clearRect(0, 0, w, h);
+
+      // фон
+      ctx.fillStyle = '#0b0e12';
+      ctx.fillRect(0, 0, w, h);
+
+      // пределы в мировых координатах
+      const [wx0, wy0] = screenToWorld(0, h);
+      const [wx1, wy1] = screenToWorld(w, 0);
+      const minX = Math.floor(wx0), maxX = Math.ceil(wx1);
+      const minY = Math.floor(wy0), maxY = Math.ceil(wy1);
+
+      // сетка целых координат
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+      ctx.beginPath();
+      for (let x = minX; x <= maxX; x++) {
+        const [sx0, sy0] = worldToScreen(x, minY);
+        const [sx1, sy1] = worldToScreen(x, maxY);
+        ctx.moveTo(sx0 + 0.5, sy0);
+        ctx.lineTo(sx1 + 0.5, sy1);
+      }
+      for (let y = minY; y <= maxY; y++) {
+        const [sx0, sy0] = worldToScreen(minX, y);
+        const [sx1, sy1] = worldToScreen(maxX, y);
+        ctx.moveTo(sx0, sy0 + 0.5);
+        ctx.lineTo(sx1, sy1 + 0.5);
+      }
+      ctx.stroke();
+
+      // оси x=0 и y=0
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      // y-ось
+      if (minX <= 0 && maxX >= 0) {
+        const [sx0, sy0] = worldToScreen(0, minY);
+        const [sx1, sy1] = worldToScreen(0, maxY);
+        ctx.moveTo(sx0 + 0.5, sy0);
+        ctx.lineTo(sx1 + 0.5, sy1);
+      }
+      // x-ось
+      if (minY <= 0 && maxY >= 0) {
+        const [sx0, sy0] = worldToScreen(minX, 0);
+        const [sx1, sy1] = worldToScreen(maxX, 0);
+        ctx.moveTo(sx0, sy0 + 0.5);
+        ctx.lineTo(sx1, sy1 + 0.5);
+      }
+      ctx.stroke();
+
+      // отрезки
+      for (const s of state.segments) {
+        const a = state.points.find(p => p.id === s.aId);
+        const b = state.points.find(p => p.id === s.bId);
+        if (!a || !b) continue;
+        const [sx, sy] = worldToScreen(a.x, a.y);
+        const [tx, ty] = worldToScreen(b.x, b.y);
+        ctx.lineWidth = 2.5;
+        ctx.strokeStyle = '#6fd3ff';
+        ctx.setLineDash(s.dashed ? [8, 8] : []);
+        ctx.beginPath();
+        ctx.moveTo(sx, sy);
+        ctx.lineTo(tx, ty);
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+
+      // точки
+      for (const p of state.points) {
+        const [sx, sy] = worldToScreen(p.x, p.y);
+        ctx.beginPath();
+        ctx.arc(sx, sy, 5, 0, Math.PI*2);
+        ctx.fillStyle = p.selected ? '#ffd166' : '#e6e6e6';
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = p.selected ? 'rgba(255,209,102,0.7)' : 'rgba(255,255,255,0.35)';
+        ctx.stroke();
+      }
+
+      // HUD
+      document.getElementById('hud').textContent =
+        state.selection.length === 1 ? 'Выбрана 1 точка — выберите вторую для создания отрезка' :
+        state.selection.length === 2 ? 'Выбрано 2 точки — тапните по свободному месту, чтобы продолжить' : '';
+    }
+
+    // Хит-тест точки по экранным координатам
+    function hitTestPoint(sx, sy) {
+      // ищем ближайшую решётчатую точку в радиусе pickR
+      const pickR = 12; // px
+      // сначала проверяем уже существующие точки по экранному расстоянию
+      let best = null, bestD2 = pickR*pickR;
+      for (const p of state.points) {
+        const [px, py] = worldToScreen(p.x, p.y);
+        const dx = px - sx, dy = py - sy;
+        const d2 = dx*dx + dy*dy;
+        if (d2 <= bestD2) { bestD2 = d2; best = p; }
+      }
+      return best; // либо null
+    }
+
+    // Привязка к ближайшей целой решётке
+    function snapWorldToInt(wx, wy) {
+      return [Math.round(wx), Math.round(wy)];
+    }
+
+    // Ввод: жесты/мышь
+    let dragging = null; // {type:'point'|'pan', id?, start:{sx,sy}, origPan, pressTimer?, moved:false, lastDownTime}
+    let lastTapTime = 0; // для двойного тапа
+    let initialDistance = 0; // для масштабирования двумя пальцами
+    let initialScale = 0; // для масштабирования двумя пальцами
+
+    function pointerDown(e) {
+     if (e.touches && e.touches.length >= 2) {
+        const touch1 = e.touches[0];
+        const touch2 = e.touches[1];
+        const dx = touch1.clientX - touch2.clientX;
+        const dy = touch1.clientY - touch2.clientY;
+        initialDistance = Math.sqrt(dx * dx + dy * dy);
+        initialScale = state.scale;
+        return;
+    }
+
+      const rect = canvas.getBoundingClientRect();
+      const sx = (e.clientX ?? e.touches?.[0]?.clientX) - rect.left;
+      const sy = (e.clientY ?? e.touches?.[0]?.clientY) - rect.top;
+
+      const hit = hitTestPoint(sx, sy);
+      dragging = { type: hit ? 'point' : 'pan', id: hit?.id ?? null, start:{sx, sy}, origPan:{...state.pan}, moved:false };
+
+      if (hit) {
+        // запустим таймер для долгого удержания (удаление точки)
+        dragging.pressTimer = setTimeout(() => {
+          // если всё ещё держим и не двигали — удаляем точку (и её отрезки)
+          if (dragging && dragging.type==='point' && !dragging.moved) {
+            removePoint(hit.id);
+            dragging = null; // завершить жест
+            render();
+          }
+        }, 550);
+      }
+
+      // двойной тап по точке — удалить все отрезки через неё (точка остаётся)
+      const now = performance.now();
+      const isDouble = (now - lastTapTime) < 300; // 300 мс окно
+      lastTapTime = now;
+      if (isDouble && hit) {
+        const removed = removeSegmentsThroughPoint(hit.id);
+        if (dragging?.pressTimer) clearTimeout(dragging.pressTimer);
+        dragging = null;
+        render();
+        return;
+      }
+
+      e.preventDefault();
+    }
+
+    function pointerMove(e) {
+      if (e.touches && e.touches.length >= 2) {
+        const touch1 = e.touches[0];
+        const touch2 = e.touches[1];
+        const dx = touch1.clientX - touch2.clientX;
+        const dy = touch1.clientY - touch2.clientY;
+        const currentDistance = Math.sqrt(dx * dx + dy * dy);
+        
+        if (initialDistance > 0) {
+            const scaleFactor = currentDistance / initialDistance;
+            const newScale = initialScale * scaleFactor;
+            
+            // Ограничиваем масштаб
+            state.scale = Math.max(10, Math.min(200, newScale)); // Минимум 10, максимум 200
+            render();
+        }
+        return;
+    }
+
+      if (!dragging) return;
+      const rect = canvas.getBoundingClientRect();
+      const sx = (e.clientX ?? e.touches?.[0]?.clientX) - rect.left;
+      const sy = (e.clientY ?? e.touches?.[0]?.clientY) - rect.top;
+      const dx = sx - dragging.start.sx;
+      const dy = sy - dragging.start.sy;
+
+      if (dragging.type === 'pan') {
+        dragging.moved = true;
+        state.pan.x = dragging.origPan.x + dx;
+        state.pan.y = dragging.origPan.y + dy;
+        render();
+      } else if (dragging.type === 'point') {
+        // если сместили значительно — это перенос точки, отменяем long-press
+        if (Math.hypot(dx,dy) > 4 && dragging.pressTimer) {
+          clearTimeout(dragging.pressTimer); dragging.pressTimer = null;
+        }
+        dragging.moved = true;
+        const [wx, wy] = screenToWorld(sx, sy);
+        const [ix, iy] = snapWorldToInt(wx, wy);
+        // предварительный превью: двигаем без истории, историю добавим на mouseup
+        const p = state.points.find(pt => pt.id === dragging.id);
+        if (p) { p.x = ix; p.y = iy; render(); }
+      }
+      e.preventDefault();
+    }
+
+    function pointerUp(e) {
+      if (e.touches && e.touches.length >= 2) {
+        // Обновляем initialScale и initialDistance для плавного продолжения масштабирования
+        const touch1 = e.touches[0];
+        const touch2 = e.touches[1];
+        const dx = touch1.clientX - touch2.clientX;
+        const dy = touch1.clientY - touch2.clientY;
+        initialDistance = Math.sqrt(dx * dx + dy * dy);
+        initialScale = state.scale;
+        return;
+    }
+
+      if (!dragging) return;
+      if (dragging.pressTimer) { clearTimeout(dragging.pressTimer); }
+      const rect = canvas.getBoundingClientRect();
+      const sx = (e.clientX ?? dragging.start.sx) - rect.left;
+      const sy = (e.clientY ?? dragging.start.sy) - rect.top;
+
+      if (dragging.type === 'point') {
+        if (!dragging.moved) {
+          // это тап по точке — выбор/снятие выбора и, возможно, создание отрезка
+          const p = state.points.find(pt => pt.id === dragging.id);
+          if (p) {
+            pushHistory();
+            toggleSelectPoint(p.id);
+            if (state.selection.length === 2) {
+              const [a, b] = state.selection;
+              addOrToggleSegmentBetween(a, b);
+              // снимем выделение
+              for (const id of state.selection) {
+                const pp = state.points.find(q => q.id === id); if (pp) pp.selected = false;
+              }
+              state.selection = [];
+            }
+          }
+        } else {
+          // завершили перенос точки — фиксируем в истории (как отдельное действие)
+          pushHistory(); // уже положение на момент отпускания
+        }
+      } else if (dragging.type === 'pan') {
+        // если это был клик по пустому месту, можно создать точку на узле решётки
+        if (!dragging.moved) {
+          const [wx, wy] = screenToWorld(sx, sy);
+          const [ix, iy] = snapWorldToInt(wx, wy);
+          const nearExisting = findPointAtInt(ix, iy);
+          if (!nearExisting) {
+            addPoint(ix, iy);
+          } else {
+            // если тап по пустому месту, но рядом есть точка — ничего не делаем
+          }
+        }
+      }
+      dragging = null;
+      render();
+      e.preventDefault();
+    }
+
+    // Кнопки
+    const undoBtn = document.getElementById('undo');
+    const resetBtn = document.getElementById('reset');
+    const modeBtn = document.getElementById('modeToggle');
+    const modeIcon = document.getElementById('modeIcon');
+    const modeBadge = document.getElementById('modeBadge');
+    const closeBtn = document.getElementById('closeBtn');
+    const banner = document.getElementById('banner');
+
+    undoBtn.addEventListener('click', undo);
+    resetBtn.addEventListener('click', () => {
+      pushHistory();
+      state.points = [];
+      state.segments = [];
+      state.selection = [];
+      render();
+    });
+    modeBtn.addEventListener('click', () => {
+      pushHistory();
+      state.dashedMode = !state.dashedMode;
+      modeBadge.textContent = state.dashedMode ? 'прерывистый' : 'сплошной';
+      modeIcon.textContent = state.dashedMode ? '╌' : '━';
+    });
+    closeBtn.addEventListener('click', () => {
+      banner.classList.add('hidden');
+    });
+
+    // Подключаем события (мышь + touch через Pointer Events)
+   // Подключаем события через Touch Events (для мультитача) и мышь отдельно
+canvas.addEventListener('mousedown', pointerDown);
+canvas.addEventListener('mousemove', pointerMove);
+window.addEventListener('mouseup', pointerUp);
+
+// Touch Events для мультитача
+canvas.addEventListener('touchstart', pointerDown, {passive: false});
+canvas.addEventListener('touchmove', pointerMove, {passive: false});
+canvas.addEventListener('touchend', pointerUp);
+canvas.addEventListener('touchcancel', pointerUp);
+
+    // Инициализация
+    function init() {
+      // небольшой сдвиг, чтобы (0,0) был примерно в центре
+      state.pan.x = 0; state.pan.y = 0;
+      resize();
+      // первая запись для отката
+      pushHistory();
+    }
+    window.addEventListener('resize', resize);
+    init();
+  })();
+  </script>
+</body>
+</html>
